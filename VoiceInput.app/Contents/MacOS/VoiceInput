@@ -1,5 +1,29 @@
 #!/bin/bash
+# VoiceInput launcher — works when opened from Finder
+
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-cd "/Users/tal/.qclaw/workspace/voice-input"
-source "/Users/tal/.qclaw/workspace/voice-input/.venv/bin/activate"
-exec python3 "/Users/tal/.qclaw/workspace/voice-input/voice-app.py"
+
+# Find project directory (relative to this script)
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# If running from the .app bundle, the project is the parent of VoiceInput.app
+if [ ! -f "$PROJECT_DIR/voice-app.py" ]; then
+    # Try: the .app is inside the project directory
+    PROJECT_DIR="$(dirname "$0")/../../.."
+    PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)"
+fi
+
+# Fallback: hardcoded path
+if [ ! -f "$PROJECT_DIR/voice-app.py" ]; then
+    PROJECT_DIR="/Users/tal/.qclaw/workspace/voice-input"
+fi
+
+cd "$PROJECT_DIR" || exit 1
+
+# Activate venv
+if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
+    source "$PROJECT_DIR/.venv/bin/activate"
+fi
+
+# Run the app
+exec python3 "$PROJECT_DIR/voice-app.py"

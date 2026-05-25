@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Voice Input macOS App — Menu Bar + Global Hotkey
-Click menu bar icon or press Cmd+↑ to start/stop voice input.
+Voice Input macOS App — Menu Bar + Global Hotkey + HTTP Trigger
+Click menu bar icon, press Cmd+↑, or curl localhost:52777 to start/stop.
 
 Usage:
   python3 voice-app.py
 
 Hotkey: Cmd+↑ (press to start, press again to stop)
+HTTP:   curl http://localhost:52777/toggle
 """
 
 import os
@@ -18,7 +19,10 @@ import threading
 import urllib.request
 import wave
 import time
+import ctypes
+import ctypes.util
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import rumps
 import Quartz
@@ -40,15 +44,41 @@ AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
 AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "norwayeast")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 LANGUAGE = os.environ.get("VOICE_LANGUAGE", "fi-FI")
-MAX_DURATION = int(os.environ.get("RECORD_DURATION", "60"))  # max 60s safety limit
+MAX_DURATION = int(os.environ.get("RECORD_DURATION", "60"))
+
+HTTP_PORT = 52777
 
 # Audio settings
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-# Global stop flag for toggle recording
+# Global stop flag
 _stop_recording = threading.Event()
+_app_instance = None  # reference to rumps app
 
+
+def has_accessibility():
+    """Check accessibility permission via ctypes (pyobjc Quartz doesn't have this)"""
+    try:
+        lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('ApplicationServices'))
+        return bool(lib.AXIsProcessTrusted())
+    except:
+        return False
+
+
+def prompt_accessibility():
+    """Prompt user to grant accessibility (opens system dialog)"""
+    try:
+        lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('ApplicationServices'))
+        # kAXTrustedCheckOptionPrompt = True to show the system dialog
+        prompt_key = ctypes.c_void_p
+        options = ctypes.py_object({"kAXTrustedCheckOptionPrompt": True})
+        return bool(lib.AXIsProcessTrustedWithOptions(options))
+    except:
+        return False
+
+
+# ─── Audio Recording ──────────────────────────────────────────
 
 def record_audio_toggle():
     """Record audio until stop signal or MAX_DURATION. Returns WAV path."""
@@ -56,8 +86,7 @@ def record_audio_toggle():
     _stop_recording.clear()
 
     frames = []
-    block_duration = 0.5  # record in 0.5s chunks
-    block_samples = int(block_duration * SAMPLE_RATE)
+    block_samples = int(0.5 * SAMPLE_RATE)
 
     def callback(indata, frames_count, time_info, status):
         frames.append(indata.copy())
@@ -73,16 +102,14 @@ def record_audio_toggle():
         if not frames:
             return None
 
-        # Concatenate all frames
         recording = np.concatenate(frames, axis=0)
 
-        # Auto-gain: boost quiet recordings
+        # Auto-gain
         rms = np.sqrt(np.mean(recording.astype(float)**2))
         if rms > 0 and rms < 300:
             gain = min(3000.0 / rms, 30.0)
             recording = np.clip(recording.astype(float) * gain, -32768, 32767).astype('int16')
 
-        # Save as WAV
         output = tempfile.mktemp(suffix=".wav")
         with wave.open(output, 'wb') as wf:
             wf.setnchannels(CHANNELS)
@@ -96,11 +123,10 @@ def record_audio_toggle():
         return None
 
 
+# ─── Azure Transcription ──────────────────────────────────────
+
 def azure_transcribe(audio_path):
-    """Transcribe with Azure Speech SDK using continuous recognition.
-    recognize_once only gets the first ~15s utterance.
-    Continuous recognition collects ALL segments until the audio ends.
-    """
+    """Continuous recognition — transcribes entire audio file."""
     if not AZURE_KEY:
         return None, "Azure key not configured"
 
@@ -113,7 +139,6 @@ def azure_transcribe(audio_path):
         audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
         recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
-        # Collect all recognized segments
         results = []
         done = threading.Event()
 
@@ -132,13 +157,8 @@ def azure_transcribe(audio_path):
         recognizer.session_stopped.connect(on_session_stopped)
         recognizer.canceled.connect(on_canceled)
 
-        # Start continuous recognition
         recognizer.start_continuous_recognition_async().get()
-
-        # Wait until audio is fully processed
         done.wait(timeout=120)
-
-        # Stop recognition
         recognizer.stop_continuous_recognition_async().get()
 
         if results:
@@ -149,6 +169,8 @@ def azure_transcribe(audio_path):
     except Exception as e:
         return None, str(e)
 
+
+# ─── DeepSeek Correction ──────────────────────────────────────
 
 def deepseek_correct(text):
     """Correct text with DeepSeek"""
@@ -195,6 +217,8 @@ Palauta VAIN korjattu teksti, ei selityksiä."""
         return text
 
 
+# ─── Clipboard & Paste ────────────────────────────────────────
+
 def copy_and_paste(text):
     """Copy to clipboard and simulate Cmd+V"""
     process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
@@ -209,10 +233,46 @@ def copy_and_paste(text):
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, cmd_v_up)
 
 
-def has_accessibility():
-    """Check if we have accessibility permissions"""
-    return Quartz.AXIsProcessTrusted()
+# ─── HTTP Server (alternative trigger) ────────────────────────
 
+class ToggleHandler(BaseHTTPRequestHandler):
+    """HTTP endpoint: curl localhost:52777/toggle to start/stop recording"""
+    def do_GET(self):
+        global _app_instance
+        if self.path == '/toggle' and _app_instance:
+            if _app_instance.is_recording:
+                _app_instance.stop_recording(None)
+            else:
+                _app_instance.start_recording(None)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"recording": _app_instance.is_recording}).encode())
+        elif self.path == '/status' and _app_instance:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"recording": _app_instance.is_recording}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress HTTP logs
+
+
+def start_http_server():
+    """Start HTTP trigger server in background"""
+    try:
+        server = HTTPServer(('127.0.0.1', HTTP_PORT), ToggleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"✅ HTTP trigger: curl http://localhost:{HTTP_PORT}/toggle")
+    except OSError as e:
+        print(f"⚠️  HTTP server failed (port {HTTP_PORT} in use?): {e}")
+
+
+# ─── Main App ─────────────────────────────────────────────────
 
 class VoiceInputApp(rumps.App):
     def __init__(self):
@@ -222,22 +282,24 @@ class VoiceInputApp(rumps.App):
         self.menu = [
             "🎙️ Start Recording",
             "⏹️ Stop Recording",
-            None,  # separator
+            None,
             "⚙️ Accessibility Settings",
             "Quit"
         ]
-        self._setup_hotkey()
 
-    def _setup_hotkey(self):
-        """Setup global hotkey Cmd+Up (graceful if no permission)"""
+    def start_hotkey(self):
+        """Try to start global hotkey (needs accessibility permission)"""
         try:
             from pynput import keyboard
 
             if not has_accessibility():
-                print("⚠️  No accessibility permission — global hotkey disabled")
-                print("   Enable at: System Settings → Privacy & Security → Accessibility")
-                print("   You can still use the menu bar icon to record.")
-                return
+                # Try prompting for permission
+                prompt_accessibility()
+                if not has_accessibility():
+                    print("⚠️  No accessibility permission — global hotkey disabled")
+                    print("   Enable at: System Settings → Privacy & Security → Accessibility")
+                    print(f"   Alternative: curl http://localhost:{HTTP_PORT}/toggle")
+                    return
 
             def on_hotkey():
                 if self.is_recording:
@@ -258,7 +320,7 @@ class VoiceInputApp(rumps.App):
 
         except Exception as e:
             print(f"⚠️  Hotkey setup failed: {e}")
-            print("   Use menu bar icon instead.")
+            print(f"   Alternative: curl http://localhost:{HTTP_PORT}/toggle")
 
     @rumps.clicked("🎙️ Start Recording")
     def start_recording(self, _):
@@ -281,17 +343,14 @@ class VoiceInputApp(rumps.App):
 
     def _process_voice(self):
         try:
-            # Record until stop or max duration
             audio_path = record_audio_toggle()
             if not audio_path:
                 rumps.notification("Voice Input", "Error", "Recording failed")
                 return
 
-            # Transcribe
             rumps.notification("Voice Input", "Transcribing...", "")
             text, error = azure_transcribe(audio_path)
 
-            # Cleanup
             if audio_path and os.path.exists(audio_path):
                 os.unlink(audio_path)
 
@@ -299,11 +358,9 @@ class VoiceInputApp(rumps.App):
                 rumps.notification("Voice Input", "No speech", error or "Try speaking louder")
                 return
 
-            # Correct
             rumps.notification("Voice Input", "Correcting...", "")
             corrected = deepseek_correct(text)
 
-            # Copy and paste
             copy_and_paste(corrected)
             preview = corrected[:50] + "..." if len(corrected) > 50 else corrected
             rumps.notification("Voice Input", "Done!", preview)
@@ -324,5 +381,12 @@ class VoiceInputApp(rumps.App):
 
 
 if __name__ == "__main__":
-    app = VoiceInputApp()
-    app.run()
+    _app_instance = VoiceInputApp()
+
+    # Start HTTP trigger (always works, no permission needed)
+    start_http_server()
+
+    # Try hotkey (needs accessibility)
+    _app_instance.start_hotkey()
+
+    _app_instance.run()

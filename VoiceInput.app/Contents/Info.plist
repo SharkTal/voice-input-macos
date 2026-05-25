@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.sisu.voiceinput</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>1.1.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.1.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -22,6 +22,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Voice Input needs microphone access for speech recognition.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Voice Input needs accessibility access for global hotkey.</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
 </dict>
