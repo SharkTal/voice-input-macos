@@ -1,0 +1,9 @@
+.env
+.venv/
+models/
+*.pyc
+__pycache__/
+.DS_Store
+*.wav
+*.m4a
+icon-source.png

@@ -1,0 +1,5 @@
+#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+cd "/Users/tal/.qclaw/workspace/voice-input"
+source "/Users/tal/.qclaw/workspace/voice-input/.venv/bin/activate"
+exec python3 "/Users/tal/.qclaw/workspace/voice-input/voice-app.py"
