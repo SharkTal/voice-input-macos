@@ -97,7 +97,10 @@ def record_audio_toggle():
 
 
 def azure_transcribe(audio_path):
-    """Transcribe with Azure Speech SDK"""
+    """Transcribe with Azure Speech SDK using continuous recognition.
+    recognize_once only gets the first ~15s utterance.
+    Continuous recognition collects ALL segments until the audio ends.
+    """
     if not AZURE_KEY:
         return None, "Azure key not configured"
 
@@ -110,17 +113,38 @@ def azure_transcribe(audio_path):
         audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
         recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
-        result = recognizer.recognize_once_async().get()
+        # Collect all recognized segments
+        results = []
+        done = threading.Event()
 
-        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            return result.text, None
-        elif result.reason == speechsdk.ResultReason.NoMatch:
-            return None, "No speech detected — try speaking louder or closer to mic"
-        elif result.reason == speechsdk.ResultReason.Canceled:
-            details = result.cancellation_details
-            return None, f"Canceled: {details.reason}. {details.error_details}"
+        def on_recognized(evt):
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech and evt.result.text:
+                results.append(evt.result.text)
+                print(f"  Segment: {evt.result.text}")
+
+        def on_session_stopped(evt):
+            done.set()
+
+        def on_canceled(evt):
+            done.set()
+
+        recognizer.recognized.connect(on_recognized)
+        recognizer.session_stopped.connect(on_session_stopped)
+        recognizer.canceled.connect(on_canceled)
+
+        # Start continuous recognition
+        recognizer.start_continuous_recognition_async().get()
+
+        # Wait until audio is fully processed
+        done.wait(timeout=120)
+
+        # Stop recognition
+        recognizer.stop_continuous_recognition_async().get()
+
+        if results:
+            return " ".join(results), None
         else:
-            return None, f"Unknown error: {result.reason}"
+            return None, "No speech detected — try speaking louder or closer to mic"
 
     except Exception as e:
         return None, str(e)
