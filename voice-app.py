@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Voice Input macOS App — Menu Bar + Global Hotkey
-Click menu bar icon or press Ctrl+Space to start voice input.
+Click menu bar icon or press Cmd+↑ to start/stop voice input.
 
 Usage:
   python3 voice-app.py
+
+Hotkey: Cmd+↑ (press to start, press again to stop)
 """
 
 import os
@@ -14,11 +16,14 @@ import tempfile
 import subprocess
 import threading
 import urllib.request
+import wave
+import time
 from pathlib import Path
 
 import rumps
-from pynput import keyboard
 import Quartz
+import numpy as np
+import sounddevice as sd
 
 # Load .env
 def load_env():
@@ -34,43 +39,89 @@ load_env()
 AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
 AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "norwayeast")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-LANGUAGE = "fi-FI"
+LANGUAGE = os.environ.get("VOICE_LANGUAGE", "fi-FI")
+MAX_DURATION = int(os.environ.get("RECORD_DURATION", "60"))  # max 60s safety limit
+
+# Audio settings
+SAMPLE_RATE = 16000
+CHANNELS = 1
+
+# Global stop flag for toggle recording
+_stop_recording = threading.Event()
 
 
-def record_audio(duration=10):
-    """Record audio with ffmpeg"""
-    output = tempfile.mktemp(suffix=".m4a")
-    cmd = [
-        "ffmpeg", "-f", "avfoundation", "-i", ":1",
-        "-af", "volume=20dB",
-        "-ar", "16000", "-ac", "1",
-        "-t", str(duration),
-        "-y", output
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    return output if result.returncode == 0 else None
+def record_audio_toggle():
+    """Record audio until stop signal or MAX_DURATION. Returns WAV path."""
+    global _stop_recording
+    _stop_recording.clear()
+
+    frames = []
+    block_duration = 0.5  # record in 0.5s chunks
+    block_samples = int(block_duration * SAMPLE_RATE)
+
+    def callback(indata, frames_count, time_info, status):
+        frames.append(indata.copy())
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16',
+                           blocksize=block_samples, callback=callback):
+            elapsed = 0
+            while not _stop_recording.is_set() and elapsed < MAX_DURATION:
+                time.sleep(0.1)
+                elapsed += 0.1
+
+        if not frames:
+            return None
+
+        # Concatenate all frames
+        recording = np.concatenate(frames, axis=0)
+
+        # Auto-gain: boost quiet recordings
+        rms = np.sqrt(np.mean(recording.astype(float)**2))
+        if rms > 0 and rms < 300:
+            gain = min(3000.0 / rms, 30.0)
+            recording = np.clip(recording.astype(float) * gain, -32768, 32767).astype('int16')
+
+        # Save as WAV
+        output = tempfile.mktemp(suffix=".wav")
+        with wave.open(output, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(recording.tobytes())
+
+        return output
+    except Exception as e:
+        print(f"Recording error: {e}")
+        return None
 
 
 def azure_transcribe(audio_path):
-    """Transcribe with Azure Speech API"""
+    """Transcribe with Azure Speech SDK"""
     if not AZURE_KEY:
         return None, "Azure key not configured"
 
-    with open(audio_path, "rb") as f:
-        audio_data = f.read()
-
-    url = f"https://{AZURE_REGION}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language={LANGUAGE}&format=detailed"
-
-    req = urllib.request.Request(url, data=audio_data, method="POST")
-    req.add_header("Ocp-Apim-Subscription-Key", AZURE_KEY)
-    req.add_header("Content-Type", "audio/m4a; codec=audio/pcm; samplerate=16000")
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            if "NBest" in data and data["NBest"]:
-                return data["NBest"][0].get("Display"), None
-            return None, "No speech detected"
+        import azure.cognitiveservices.speech as speechsdk
+
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
+        speech_config.speech_recognition_language = LANGUAGE
+
+        audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
+        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+        result = recognizer.recognize_once_async().get()
+
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            return result.text, None
+        elif result.reason == speechsdk.ResultReason.NoMatch:
+            return None, "No speech detected — try speaking louder or closer to mic"
+        elif result.reason == speechsdk.ResultReason.Canceled:
+            details = result.cancellation_details
+            return None, f"Canceled: {details.reason}. {details.error_details}"
+        else:
+            return None, f"Unknown error: {result.reason}"
+
     except Exception as e:
         return None, str(e)
 
@@ -80,7 +131,15 @@ def deepseek_correct(text):
     if not DEEPSEEK_KEY:
         return text
 
-    system_prompt = """Olet suomen kielen korjaaja. Käyttäjä puhuu ääneen ja puheentunnistus tekee virheitä.
+    lang_map = {
+        "fi-FI": "suomen kielen",
+        "zh-CN": "中文",
+        "sv-SE": "svenska",
+        "en-US": "English",
+    }
+    lang_name = lang_map.get(LANGUAGE, "text")
+
+    system_prompt = f"""Olet {lang_name} korjaaja. Käyttäjä puhuu ääneen ja puheentunnistus tekee virheitä.
 
 Tehtäväsi:
 1. Korjaa puheentunnistuksen virheet (väärät sanat, puuttuvat kirjaimet)
@@ -97,7 +156,7 @@ Palauta VAIN korjattu teksti, ei selityksiä."""
             {"role": "user", "content": text}
         ],
         "temperature": 0.1,
-        "max_tokens": 2048
+        "max_tokens": 4096
     }).encode()
 
     req = urllib.request.Request("https://api.deepseek.com/v1/chat/completions", data=payload, method="POST")
@@ -126,48 +185,82 @@ def copy_and_paste(text):
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, cmd_v_up)
 
 
+def has_accessibility():
+    """Check if we have accessibility permissions"""
+    return Quartz.AXIsProcessTrusted()
+
+
 class VoiceInputApp(rumps.App):
     def __init__(self):
-        super(VoiceInputApp, name="🎤", quit_button=None)
+        rumps.App.__init__(self, "🎤", quit_button=None)
         self.is_recording = False
-        self.hotkey_listener = None
+        self.hotkey_active = False
+        self.menu = [
+            "🎙️ Start Recording",
+            "⏹️ Stop Recording",
+            None,  # separator
+            "⚙️ Accessibility Settings",
+            "Quit"
+        ]
         self._setup_hotkey()
 
     def _setup_hotkey(self):
-        """Setup global hotkey Ctrl+Space"""
-        def on_hotkey():
-            if not self.is_recording:
-                self.start_recording(None)
+        """Setup global hotkey Cmd+Up (graceful if no permission)"""
+        try:
+            from pynput import keyboard
 
-        # Run hotkey listener in background
-        def run_listener():
-            with keyboard.GlobalHotKeys({
-                '<ctrl>+<space>': on_hotkey
-            }) as h:
-                h.join()
+            if not has_accessibility():
+                print("⚠️  No accessibility permission — global hotkey disabled")
+                print("   Enable at: System Settings → Privacy & Security → Accessibility")
+                print("   You can still use the menu bar icon to record.")
+                return
 
-        thread = threading.Thread(target=run_listener, daemon=True)
-        thread.start()
+            def on_hotkey():
+                if self.is_recording:
+                    self.stop_recording(None)
+                else:
+                    self.start_recording(None)
 
-    @rumps.clicked("Start Recording")
+            def run_listener():
+                with keyboard.GlobalHotKeys({
+                    '<cmd>+<up>': on_hotkey
+                }) as h:
+                    h.join()
+
+            thread = threading.Thread(target=run_listener, daemon=True)
+            thread.start()
+            self.hotkey_active = True
+            print("✅ Global hotkey Cmd+↑ active (toggle: press to start/stop)")
+
+        except Exception as e:
+            print(f"⚠️  Hotkey setup failed: {e}")
+            print("   Use menu bar icon instead.")
+
+    @rumps.clicked("🎙️ Start Recording")
     def start_recording(self, _):
         if self.is_recording:
             return
 
         self.is_recording = True
         self.title = "🔴"
-        rumps.notification("Voice Input", "Recording...", "Speak now (10s max)")
+        rumps.notification("Voice Input", "Recording...", "Press Cmd+↑ or click Stop when done")
 
-        # Run in background thread
         thread = threading.Thread(target=self._process_voice)
         thread.start()
 
+    @rumps.clicked("⏹️ Stop Recording")
+    def stop_recording(self, _):
+        if not self.is_recording:
+            return
+        _stop_recording.set()
+        rumps.notification("Voice Input", "Stopping...", "Processing your speech")
+
     def _process_voice(self):
         try:
-            # Record
-            audio_path = record_audio(duration=10)
+            # Record until stop or max duration
+            audio_path = record_audio_toggle()
             if not audio_path:
-                rumps.alert("Error", "Recording failed")
+                rumps.notification("Voice Input", "Error", "Recording failed")
                 return
 
             # Transcribe
@@ -179,7 +272,7 @@ class VoiceInputApp(rumps.App):
                 os.unlink(audio_path)
 
             if not text:
-                rumps.alert("Error", error or "No speech detected")
+                rumps.notification("Voice Input", "No speech", error or "Try speaking louder")
                 return
 
             # Correct
@@ -188,13 +281,18 @@ class VoiceInputApp(rumps.App):
 
             # Copy and paste
             copy_and_paste(corrected)
-            rumps.notification("Voice Input", "Done!", corrected[:50] + "..." if len(corrected) > 50 else corrected)
+            preview = corrected[:50] + "..." if len(corrected) > 50 else corrected
+            rumps.notification("Voice Input", "Done!", preview)
 
         except Exception as e:
-            rumps.alert("Error", str(e))
+            rumps.notification("Voice Input", "Error", str(e))
         finally:
             self.is_recording = False
             self.title = "🎤"
+
+    @rumps.clicked("⚙️ Accessibility Settings")
+    def open_accessibility(self, _):
+        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
 
     @rumps.clicked("Quit")
     def quit_app(self, _):
